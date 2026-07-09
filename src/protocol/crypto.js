@@ -4,15 +4,20 @@ const crypto = require('crypto');
  * Photon payload encryption.
  *
  * The client negotiates a shared key with an anonymous Diffie-Hellman
- * exchange (Photon uses the Oakley Group 1 / 768-bit MODP prime with
- * generator 2), hashes the agreed secret with SHA-256 to get a 256-bit AES
- * key, and then AES-encrypts message bodies. Encrypted messages set bit 0x80
- * in their message-type byte (see gpbinary.parseMessage).
+ * exchange (Photon uses the Oakley Group 1 / 768-bit MODP prime, generator 2),
+ * derives an AES key from the agreed secret, and AES-encrypts message bodies.
+ * Encrypted messages set bit 0x80 in their message-type byte.
  *
- * The exact AES framing (whether a per-message IV is prepended) is confirmed
- * empirically the first time the client sends an encrypted message —
- * `decrypt()` tries the known schemes and remembers whichever yields a
- * parseable payload.
+ * DH interop across .NET (Photon) and Node has two historically fiddly points
+ * that different Photon builds handle differently:
+ *   1. how the shared secret's bytes are represented before hashing
+ *      (minimal big-endian vs. zero-padded to the prime length), and
+ *   2. the AES mode / IV framing.
+ * Rather than hard-code one choice, `decrypt()` tries a small matrix of
+ * (key-derivation × cipher-mode) candidates on the first encrypted message,
+ * validates each against a caller-supplied predicate (parseable GpBinary),
+ * and locks onto the winning combination for the rest of the session — the
+ * same combination is then used to encrypt outbound messages.
  */
 
 // RFC 2409 Oakley Group 1 (768-bit MODP prime)
@@ -32,111 +37,169 @@ const OAKLEY_PRIME_768 = Buffer.from([
 ]);
 
 const OAKLEY_GENERATOR = Buffer.from([0x02]);
+const PRIME_LEN = OAKLEY_PRIME_768.length; // 96
+
+function leftPad(buf, len) {
+    if (buf.length >= len) return buf;
+    return Buffer.concat([Buffer.alloc(len - buf.length), buf]);
+}
+
+function trimLeadingZeros(buf) {
+    let i = 0;
+    while (i < buf.length - 1 && buf[i] === 0) i++;
+    return buf.slice(i);
+}
+
+const sha256 = (b) => crypto.createHash('sha256').update(b).digest();
+const md5 = (b) => crypto.createHash('md5').update(b).digest();
 
 class EncryptionContext {
     constructor() {
         this._dh = crypto.createDiffieHellman(OAKLEY_PRIME_768, OAKLEY_GENERATOR);
         this._dh.generateKeys();
-        this._sharedKey = null;     // 32-byte AES key
-        this._ivScheme = null;      // 'prepend' | 'zero' | null (undetermined)
+        this._sharedSecret = null;
         this.established = false;
+
+        // Locked-in scheme once decryption succeeds
+        this._key = null;
+        this._algo = null;   // 'aes-256-cbc' | 'aes-256-ecb' | ...
+        this._ivMode = null; // 'zero' | 'prepend' | 'none'
+        this._schemeName = null;
     }
 
-    /** Server's DH public key (big-endian bytes) to send back to the client. */
     getServerPublicKey() {
         return this._dh.getPublicKey();
     }
 
-    /**
-     * Complete the exchange with the client's public key.
-     * @param {Buffer} clientPublicKey - big-endian bytes
-     */
     deriveSharedKey(clientPublicKey) {
-        const secret = this._dh.computeSecret(clientPublicKey);
-        this._sharedKey = crypto.createHash('sha256').update(secret).digest();
+        this._sharedSecret = this._dh.computeSecret(clientPublicKey);
         this.established = true;
-        return this._sharedKey;
+        return this._sharedSecret;
     }
 
-    get sharedKeyHex() {
-        return this._sharedKey ? this._sharedKey.toString('hex') : null;
+    get sharedSecretHex() {
+        return this._sharedSecret ? this._sharedSecret.toString('hex') : null;
     }
 
-    // ---- AES ----
+    get schemeName() {
+        return this._schemeName;
+    }
 
-    _decryptCbc(ciphertext, iv) {
-        const decipher = crypto.createDecipheriv('aes-256-cbc', this._sharedKey, iv);
+    /** Candidate AES keys derived from the shared secret, most-likely first. */
+    _candidateKeys() {
+        const s = this._sharedSecret;
+        const trimmed = trimLeadingZeros(s);
+        const padded = leftPad(s, PRIME_LEN);
+        const keys = [
+            ['sha256(secret)', sha256(s)],
+            ['sha256(secret,padded96)', sha256(padded)],
+            ['sha256(secret,trimmed)', sha256(trimmed)],
+            ['secret[0:32]', s.slice(0, 32)],
+            ['padded96[0:32]', padded.slice(0, 32)],
+            ['md5(secret)', md5(s)],
+            ['md5(secret,padded96)', md5(padded)],
+        ];
+        return keys.filter(([, k]) => k.length >= 16);
+    }
+
+    /** (algo, ivMode, keySlice) cipher variants to try per candidate key. */
+    _cipherVariants() {
+        return [
+            ['aes-256-cbc', 'zero', 32],
+            ['aes-256-cbc', 'prepend', 32],
+            ['aes-256-ecb', 'none', 32],
+            ['aes-128-cbc', 'zero', 16],
+            ['aes-128-cbc', 'prepend', 16],
+        ];
+    }
+
+    _runDecrypt(algo, key, ivMode, data) {
+        let iv = null;
+        let ciphertext = data;
+        if (ivMode === 'zero') {
+            iv = Buffer.alloc(algo.startsWith('aes-128') ? 16 : 16);
+        } else if (ivMode === 'prepend') {
+            iv = data.slice(0, 16);
+            ciphertext = data.slice(16);
+        }
+        const decipher = crypto.createDecipheriv(algo, key, iv);
         decipher.setAutoPadding(true);
         return Buffer.concat([decipher.update(ciphertext), decipher.final()]);
     }
 
-    _encryptCbc(plaintext, iv) {
-        const cipher = crypto.createCipheriv('aes-256-cbc', this._sharedKey, iv);
+    _runEncrypt(algo, key, ivMode, plaintext) {
+        let iv = null;
+        let prefix = Buffer.alloc(0);
+        if (ivMode === 'zero') {
+            iv = Buffer.alloc(16);
+        } else if (ivMode === 'prepend') {
+            iv = crypto.randomBytes(16);
+            prefix = iv;
+        }
+        const cipher = crypto.createCipheriv(algo, key, iv);
         cipher.setAutoPadding(true);
-        return Buffer.concat([cipher.update(plaintext), cipher.final()]);
+        return Buffer.concat([prefix, cipher.update(plaintext), cipher.final()]);
     }
 
     /**
      * Decrypt an encrypted message body.
      * @param {Buffer} data - ciphertext (message bytes after the type byte)
-     * @param {Function} [validate] - optional predicate on the plaintext;
-     *        used to auto-detect the IV scheme on first use
+     * @param {Function} [validate] - predicate on candidate plaintext used to
+     *        detect the correct scheme on first use
      * @returns {Buffer} plaintext
      */
     decrypt(data, validate = null) {
-        if (!this._sharedKey) throw new Error('Encryption key not established');
+        if (!this._sharedSecret) throw new Error('Encryption key not established');
 
-        // Once the scheme is known, use it directly.
-        if (this._ivScheme === 'zero') {
-            return this._decryptCbc(data, Buffer.alloc(16));
-        }
-        if (this._ivScheme === 'prepend') {
-            return this._decryptCbc(data.slice(16), data.slice(0, 16));
+        if (this._key) {
+            return this._runDecrypt(this._algo, this._key, this._ivMode, data);
         }
 
-        // Undetermined: try candidate schemes and keep the one that validates.
-        const candidates = [
-            ['zero', () => this._decryptCbc(data, Buffer.alloc(16))],
-            ['prepend', () => this._decryptCbc(data.slice(16), data.slice(0, 16))]
-        ];
-
-        let firstSuccess = null;
-        for (const [scheme, run] of candidates) {
-            try {
-                const plaintext = run();
+        let firstDecryptable = null;
+        for (const [keyName, key] of this._candidateKeys()) {
+            for (const [algo, ivMode, keyLen] of this._cipherVariants()) {
+                const useKey = key.length === keyLen ? key : key.slice(0, keyLen);
+                if (useKey.length !== keyLen) continue;
+                let plaintext;
+                try {
+                    plaintext = this._runDecrypt(algo, useKey, ivMode, data);
+                } catch (e) {
+                    continue; // padding error — wrong combination
+                }
+                const name = `${keyName}/${algo}/${ivMode}`;
                 if (!validate || validate(plaintext)) {
-                    this._ivScheme = scheme;
+                    this._lock(useKey, algo, ivMode, name);
                     return plaintext;
                 }
-                if (!firstSuccess) firstSuccess = { scheme, plaintext };
-            } catch (e) {
-                // padding error — wrong scheme, keep trying
+                if (!firstDecryptable) firstDecryptable = { useKey, algo, ivMode, name, plaintext };
             }
         }
 
-        if (firstSuccess) {
-            // Decrypted without a padding error but validation failed; use it
-            // and record the scheme so behaviour is stable.
-            this._ivScheme = firstSuccess.scheme;
-            return firstSuccess.plaintext;
+        if (firstDecryptable) {
+            this._lock(firstDecryptable.useKey, firstDecryptable.algo,
+                firstDecryptable.ivMode, firstDecryptable.name);
+            return firstDecryptable.plaintext;
         }
 
-        throw new Error('Unable to decrypt payload with any known IV scheme');
+        throw new Error('Unable to decrypt payload with any known key/cipher combination');
     }
 
-    /**
-     * Encrypt a plaintext message body, matching the negotiated IV scheme.
-     * @param {Buffer} plaintext
-     * @returns {Buffer} ciphertext
-     */
+    _lock(key, algo, ivMode, name) {
+        this._key = key;
+        this._algo = algo;
+        this._ivMode = ivMode;
+        this._schemeName = name;
+    }
+
     encrypt(plaintext) {
-        if (!this._sharedKey) throw new Error('Encryption key not established');
-        const scheme = this._ivScheme || 'zero';
-        if (scheme === 'prepend') {
-            const iv = crypto.randomBytes(16);
-            return Buffer.concat([iv, this._encryptCbc(plaintext, iv)]);
+        if (!this._sharedSecret) throw new Error('Encryption key not established');
+        if (!this._key) {
+            // Not yet calibrated (no inbound encrypted message seen). Fall back
+            // to the most likely scheme.
+            this._lock(sha256(this._sharedSecret), 'aes-256-cbc', 'zero',
+                'sha256(secret)/aes-256-cbc/zero');
         }
-        return this._encryptCbc(plaintext, Buffer.alloc(16));
+        return this._runEncrypt(this._algo, this._key, this._ivMode, plaintext);
     }
 }
 

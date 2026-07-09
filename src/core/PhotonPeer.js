@@ -378,23 +378,35 @@ class PhotonPeer extends EventEmitter {
                 });
                 return;
             }
+            const wasCalibrated = !!this._encryption.schemeName;
             try {
                 const header = Buffer.from([0xF3, message.messageType]);
                 const body = this._encryption.decrypt(message.raw, (plaintext) => {
                     try {
-                        gp.parseMessage(Buffer.concat([header, plaintext]));
-                        return true;
+                        const m = gp.parseMessage(Buffer.concat([header, plaintext]));
+                        // Reject false positives: the first encrypted message is
+                        // an operation request, so require a plausible op code.
+                        return typeof m.operationCode === 'number' &&
+                            m.parameters && typeof m.parameters === 'object';
                     } catch (e) {
                         return false;
                     }
                 });
                 message = gp.parseMessage(Buffer.concat([header, body]));
+                if (!wasCalibrated) {
+                    logger.info('Encryption scheme calibrated', {
+                        peerId: this._peerId,
+                        scheme: this._encryption.schemeName
+                    });
+                }
             } catch (error) {
                 this.updateStats('errors', 1);
-                logger.error('Failed to decrypt message', {
+                logger.error('Failed to decrypt message — capturing for analysis', {
                     peerId: this._peerId,
                     messageType: message.messageType,
-                    error: error.message
+                    error: error.message,
+                    sharedSecret: this._encryption.sharedSecretHex,
+                    ciphertext: message.raw.toString('hex')
                 });
                 return;
             }
