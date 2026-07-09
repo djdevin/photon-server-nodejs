@@ -2,6 +2,7 @@ const EventEmitter = require('events');
 const logger = require('../utils/logger');
 const enet = require('../protocol/enet');
 const gp = require('../protocol/gpbinary');
+const { EncryptionContext } = require('../protocol/crypto');
 const {
     ENET_COMMANDS,
     MESSAGE_TYPES,
@@ -82,6 +83,7 @@ class PhotonPeer extends EventEmitter {
         };
 
         this._room = null;
+        this._encryption = null; // EncryptionContext once negotiated
         this.actorNr = 0;
         this.actorProperties = new Map();
         this.clientInfo = null; // filled from the Init message
@@ -368,11 +370,34 @@ class PhotonPeer extends EventEmitter {
         }
 
         if (message.encrypted) {
-            logger.error('Received encrypted message but encryption is not implemented', {
-                peerId: this._peerId,
-                messageType: message.messageType
-            });
-            return;
+            if (!this._encryption || !this._encryption.established) {
+                this.updateStats('errors', 1);
+                logger.error('Received encrypted message before key exchange completed', {
+                    peerId: this._peerId,
+                    messageType: message.messageType
+                });
+                return;
+            }
+            try {
+                const header = Buffer.from([0xF3, message.messageType]);
+                const body = this._encryption.decrypt(message.raw, (plaintext) => {
+                    try {
+                        gp.parseMessage(Buffer.concat([header, plaintext]));
+                        return true;
+                    } catch (e) {
+                        return false;
+                    }
+                });
+                message = gp.parseMessage(Buffer.concat([header, body]));
+            } catch (error) {
+                this.updateStats('errors', 1);
+                logger.error('Failed to decrypt message', {
+                    peerId: this._peerId,
+                    messageType: message.messageType,
+                    error: error.message
+                });
+                return;
+            }
         }
 
         switch (message.messageType) {
@@ -421,12 +446,7 @@ class PhotonPeer extends EventEmitter {
             }
 
             case INTERNAL_OPERATIONS.INIT_ENCRYPTION:
-                logger.error('Client requested encryption (InitEncryption) — not implemented. ' +
-                    'The client will likely disconnect.', { peerId: this._peerId });
-                this.sendMessage(gp.buildOperationResponse(
-                    INTERNAL_OPERATIONS.INIT_ENCRYPTION, -1, {},
-                    'Encryption not supported by this server', true
-                ));
+                this._handleInitEncryption(message);
                 break;
 
             default:
@@ -435,6 +455,104 @@ class PhotonPeer extends EventEmitter {
                     operationCode: message.operationCode
                 });
         }
+    }
+
+    /**
+     * Complete the Diffie-Hellman encryption handshake.
+     *
+     * The client's public key arrives as the sole byte-array parameter; we
+     * respond (cleartext) with the server public key under the same code, and
+     * from then on decrypt inbound encrypted messages and encrypt operation
+     * responses.
+     */
+    _handleInitEncryption(message) {
+        const params = message.parameters || {};
+        logger.info('InitEncryption request', {
+            peerId: this._peerId,
+            parameters: this._describeParams(params)
+        });
+
+        let keyCode = null;
+        let clientPublicKey = null;
+        for (const [code, value] of Object.entries(params)) {
+            const v = value instanceof gp.Typed ? value.value : value;
+            if (Buffer.isBuffer(v)) {
+                keyCode = Number(code);
+                clientPublicKey = v;
+                break;
+            }
+        }
+
+        if (!clientPublicKey) {
+            logger.error('InitEncryption request had no public key parameter', {
+                peerId: this._peerId,
+                parameters: this._describeParams(params)
+            });
+            return;
+        }
+
+        try {
+            this._encryption = new EncryptionContext();
+            const serverPublicKey = this._encryption.getServerPublicKey();
+            this._encryption.deriveSharedKey(clientPublicKey);
+
+            logger.info('Encryption established', {
+                peerId: this._peerId,
+                clientKeyCode: keyCode,
+                clientKeyLen: clientPublicKey.length,
+                serverKeyLen: serverPublicKey.length
+            });
+
+            // Handshake response MUST be cleartext — the client cannot decrypt
+            // until it processes this and derives the shared key itself.
+            const response = gp.buildOperationResponse(
+                INTERNAL_OPERATIONS.INIT_ENCRYPTION, 0,
+                { [keyCode]: gp.T.byteArray(serverPublicKey) },
+                null, true
+            );
+            this.sendMessage(response);
+        } catch (error) {
+            this._encryption = null;
+            this.updateStats('errors', 1);
+            logger.error('Encryption handshake failed', {
+                peerId: this._peerId,
+                error: error.message
+            });
+        }
+    }
+
+    /**
+     * Wrap a message payload for encryption if a key has been established.
+     * Cleartext passes through unchanged.
+     */
+    _encryptPayload(payload) {
+        if (!this._encryption || !this._encryption.established) return payload;
+        const type = payload[1];
+        const body = payload.slice(2);
+        const ciphertext = this._encryption.encrypt(body);
+        return Buffer.concat([Buffer.from([0xF3, type | 0x80]), ciphertext]);
+    }
+
+    /**
+     * Summarize a parsed parameter dictionary for diagnostic logging:
+     * each code with its value's JS/Typed shape, and for byte arrays the
+     * length + hex (so we can identify a DH public key and its group size).
+     */
+    _describeParams(params) {
+        const out = {};
+        for (const [code, value] of Object.entries(params || {})) {
+            const v = value instanceof gp.Typed ? value.value : value;
+            if (Buffer.isBuffer(v)) {
+                out[code] = `byte[${v.length}] ${v.toString('hex')}`;
+            } else if (value instanceof gp.Typed) {
+                out[code] = `${value.type}(${v})`;
+            } else if (v instanceof Map) {
+                out[code] = `hashtable(size=${v.size})`;
+            } else {
+                out[code] = `${typeof v}(${v})`;
+            }
+        }
+        return out;
     }
 
     // ------------------------------------------------------------------
@@ -571,9 +689,8 @@ class PhotonPeer extends EventEmitter {
      * @param {string} [debugMessage] - optional debug string
      */
     sendOperationResponse(opCode, returnCode = 0, parameters = {}, debugMessage = null) {
-        const ok = this.sendMessage(
-            gp.buildOperationResponse(opCode, returnCode, parameters, debugMessage)
-        );
+        const payload = gp.buildOperationResponse(opCode, returnCode, parameters, debugMessage);
+        const ok = this.sendMessage(this._encryptPayload(payload));
         if (ok) this.updateStats('operationsSent', 1);
         return ok;
     }

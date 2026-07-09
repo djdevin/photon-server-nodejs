@@ -12,6 +12,7 @@ const dgram = require('dgram');
 const { PhotonServer } = require('../src');
 const enet = require('../src/protocol/enet');
 const gp = require('../src/protocol/gpbinary');
+const { EncryptionContext } = require('../src/protocol/crypto');
 const { T, raw } = gp;
 
 const PORT = 15055;
@@ -75,8 +76,7 @@ class TestClient {
             } else if (cmd.type === 6 || cmd.type === 7) {
                 const payload = cmd.payload;
                 if (payload.length >= 2 && payload[0] === 0xF3) {
-                    const message = gp.parseMessage(payload);
-                    this._notify({ kind: 'message', message });
+                    this._notify({ kind: 'message', message: this._decodeMessage(payload) });
                 }
             } else if (cmd.type === 8) { // SEND_FRAGMENT
                 let frag = this.fragments.get(cmd.startSequenceNumber);
@@ -97,6 +97,16 @@ class TestClient {
             }
         }
         if (acks.length > 0) this._send(acks);
+    }
+
+    _decodeMessage(payload) {
+        let message = gp.parseMessage(payload);
+        if (message.encrypted && this.enc && this.enc.established) {
+            const header = Buffer.from([0xF3, message.messageType]);
+            const body = this.enc.decrypt(message.raw);
+            message = gp.parseMessage(Buffer.concat([header, body]));
+        }
+        return message;
     }
 
     _notify(item) {
@@ -166,10 +176,11 @@ class TestClient {
         }
     }
 
-    sendOperation(opCode, params, internal = false) {
+    sendOperation(opCode, params, internal = false, encrypt = false) {
         const w = new gp.Writer();
+        const type = internal ? 6 : 2;
         w.u8(0xF3);
-        w.u8(internal ? 6 : 2);
+        w.u8(type);
         w.u8(opCode);
         const entries = Object.entries(params);
         w.i16(entries.length);
@@ -177,7 +188,22 @@ class TestClient {
             w.u8(Number(code));
             w.value(value);
         }
-        this.sendReliable(w.buffer());
+        let payload = w.buffer();
+        if (encrypt && this.enc && this.enc.established) {
+            const body = payload.slice(2);
+            payload = Buffer.concat([Buffer.from([0xF3, type | 0x80]), this.enc.encrypt(body)]);
+        }
+        this.sendReliable(payload);
+    }
+
+    async establishEncryption() {
+        this.enc = new EncryptionContext();
+        // Send our public key under param code 1 (the code is echoed back)
+        this.sendOperation(0, { 1: T.byteArray(this.enc.getServerPublicKey()) }, true);
+        const resp = await this.waitForResponse(0);
+        const serverKey = raw(resp.parameters[1]);
+        this.enc.deriveSharedKey(serverKey);
+        return resp;
     }
 
     waitForResponse(opCode, timeoutMs = 3000) {
@@ -276,6 +302,23 @@ async function main() {
     console.log('server started');
 
     try {
+        // Encryption handshake + encrypted authenticate (mirrors the VRChat client)
+        const enc = new TestClient('encrypted');
+        await enc.connect();
+        enc.sendReliable(INIT_MESSAGE);
+        await enc.wait('init response', (m) => m.kind === 'message' && m.message.messageType === 1);
+        const encResp = await enc.establishEncryption();
+        assert(encResp.returnCode === 0, 'encryption handshake ok');
+        assert(enc.enc.established, 'client derived shared key');
+
+        // Authenticate over the encrypted channel; response comes back encrypted
+        enc.sendOperation(230, { 220: T.string('test-app-1.0'), 225: T.string('secure-user') },
+            false, true);
+        const secureAuth = await enc.waitForResponse(230);
+        assert(secureAuth.returnCode === 0, 'encrypted authenticate ok');
+        assert(raw(secureAuth.parameters[225]) === 'secure-user', 'decrypted auth response intact');
+        enc.close();
+
         // Client A: full connect + join flow
         const a = await fullClientFlow('alice', 'TestRoom');
 
