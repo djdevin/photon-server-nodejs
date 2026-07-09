@@ -238,6 +238,19 @@ class PhotonPeer extends EventEmitter {
                 this._ackAndOrder(command, packet, () => { /* keep-alive only */ });
                 break;
 
+            case ENET_COMMANDS.FETCH_SERVER_TIMESTAMP: {
+                if (command.flags & enet.FLAG_RELIABLE) {
+                    this._queueCommand(enet.buildAck(
+                        command.channelId, command.reliableSequenceNumber, packet.sentTime
+                    ));
+                }
+                const control = this._channel(CONTROL_CHANNEL);
+                const seq = ++control.outSeq;
+                const stamp = enet.buildServerTimestamp(seq, Date.now() & 0x7FFFFFFF);
+                this._queueReliable(CONTROL_CHANNEL, seq, stamp);
+                break;
+            }
+
             case ENET_COMMANDS.SEND_RELIABLE:
                 this._ackAndOrder(command, packet, (cmd) => this._handleMessage(cmd.payload));
                 break;
@@ -254,6 +267,13 @@ class PhotonPeer extends EventEmitter {
                 break;
 
             default:
+                // ACK unrecognized reliable commands so the client does not
+                // retransmit them indefinitely.
+                if (command.flags & enet.FLAG_RELIABLE) {
+                    this._queueCommand(enet.buildAck(
+                        command.channelId, command.reliableSequenceNumber, packet.sentTime
+                    ));
+                }
                 logger.warn('Unknown ENet command type', {
                     peerId: this._peerId,
                     commandType: command.type

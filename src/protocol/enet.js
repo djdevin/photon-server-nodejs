@@ -211,6 +211,18 @@ function buildPing(sequenceNumber) {
 }
 
 /**
+ * Build a FETCH_SERVER_TIMESTAMP reply carrying a 4-byte server time.
+ */
+function buildServerTimestamp(sequenceNumber, serverTime) {
+    const buf = _commandHeader(
+        ENET_COMMANDS.FETCH_SERVER_TIMESTAMP, 0xFF, FLAG_RELIABLE,
+        COMMAND_HEADER_SIZE + 4, sequenceNumber
+    );
+    buf.writeInt32BE(serverTime | 0, COMMAND_HEADER_SIZE);
+    return buf;
+}
+
+/**
  * Build a DISCONNECT command.
  */
 function buildDisconnect(sequenceNumber) {
@@ -247,6 +259,7 @@ module.exports = {
     buildUnreliable,
     buildFragment,
     buildPing,
+    buildServerTimestamp,
     buildDisconnect,
     parseConnectPayload
 };

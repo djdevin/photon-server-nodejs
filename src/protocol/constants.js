@@ -12,7 +12,8 @@ const ENET_COMMANDS = {
     PING: 5,
     SEND_RELIABLE: 6,
     SEND_UNRELIABLE: 7,
-    SEND_FRAGMENT: 8
+    SEND_FRAGMENT: 8,
+    FETCH_SERVER_TIMESTAMP: 12
 };
 
 // Legacy alias (older code referred to these as PHOTON_COMMANDS)
