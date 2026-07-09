@@ -1,10 +1,27 @@
-const { PHOTON_OPERATIONS, PHOTON_RETURN_CODES } = require('../protocol/constants');
-const PhotonRoom = require('../core/PhotonRoom');
+const crypto = require('crypto');
+const gp = require('../protocol/gpbinary');
 const logger = require('../utils/logger');
+const {
+    PHOTON_OPERATIONS: OPS,
+    PHOTON_PARAMS: P,
+    PHOTON_EVENTS: EV,
+    GAME_PROPERTY_KEYS: GPK,
+    ACTOR_PROPERTY_KEYS: APK,
+    EVENT_CACHING,
+    RECEIVER_GROUPS,
+    PHOTON_RETURN_CODES: RC
+} = require('../protocol/constants');
+
+const { T, raw } = gp;
 
 /**
- * Handles all Photon operations from connected peers
- * Provides secure, validated processing of client requests
+ * Handles LoadBalancing operations from Photon clients.
+ *
+ * This server plays both LoadBalancing roles at one address: clients first
+ * authenticate against it as the "master server"; when they create/join a
+ * room the response points them at the game server — the same address —
+ * and they reconnect and re-authenticate (carrying the token in parameter
+ * 221) before actually entering the room.
  */
 class OperationHandler {
     /**
@@ -15,646 +32,525 @@ class OperationHandler {
             throw new Error('Server instance is required');
         }
         this.server = server;
-        this._operationHandlers = this._initializeHandlers();
     }
 
     /**
-     * Initialize operation handler mappings
-     * @private
-     * @returns {Map<number, Function>} Handler mappings
+     * Process an operation request message from a peer.
+     * @param {PhotonPeer} peer
+     * @param {Object} message - {operationCode, parameters}
      */
-    _initializeHandlers() {
-        return new Map([
-            [PHOTON_OPERATIONS.AUTHENTICATE, this._handleAuthentication.bind(this)],
-            [PHOTON_OPERATIONS.JOIN_ROOM, this._handleJoinRoom.bind(this)],
-            [PHOTON_OPERATIONS.LEAVE_ROOM, this._handleLeaveRoom.bind(this)],
-            [PHOTON_OPERATIONS.CHANGE_PROPERTIES, this._handleChangeProperties.bind(this)],
-            [PHOTON_OPERATIONS.GET_ROOMS, this._handleGetRooms.bind(this)],
-            [PHOTON_OPERATIONS.RAISE_EVENT, this._handleRaiseEvent.bind(this)],
-            [PHOTON_OPERATIONS.CREATE_ROOM, this._handleCreateRoom.bind(this)],
-            [PHOTON_OPERATIONS.JOIN_RANDOM_ROOM, this._handleJoinRandomRoom.bind(this)],
-            [PHOTON_OPERATIONS.GET_ROOM_LIST, this._handleGetRoomList.bind(this)]
-        ]);
-    }
+    async handleOperation(peer, message) {
+        const opCode = message.operationCode;
+        const params = message.parameters || {};
 
-    /**
-     * Process incoming operation from peer
-     * @param {PhotonPeer} peer - The peer sending the operation
-     * @param {Object} operation - The operation data
-     */
-    async handleOperation(peer, operation) {
+        logger.debug('Operation received', {
+            peerId: peer.peerId,
+            opCode,
+            paramCodes: Object.keys(params)
+        });
+
         try {
-            this._validateOperation(operation);
-            this._validatePeer(peer);
-
-            const opCode = operation.OperationCode || operation.Code;
-            const parameters = operation.Parameters || {};
-
-            logger.debug(`Processing operation ${opCode} from peer ${peer.peerId}`, {
+            switch (opCode) {
+                case OPS.AUTHENTICATE: return this._authenticate(peer, params);
+                case OPS.JOIN_LOBBY: return this._joinLobby(peer, params);
+                case OPS.LEAVE_LOBBY: return this._leaveLobby(peer, params);
+                case OPS.CREATE_GAME: return this._createOrJoinGame(peer, OPS.CREATE_GAME, params);
+                case OPS.JOIN_GAME: return this._createOrJoinGame(peer, OPS.JOIN_GAME, params);
+                case OPS.JOIN_RANDOM_GAME: return this._joinRandomGame(peer, params);
+                case OPS.LEAVE: return this._leave(peer, params);
+                case OPS.RAISE_EVENT: return this._raiseEvent(peer, params);
+                case OPS.SET_PROPERTIES: return this._setProperties(peer, params);
+                case OPS.GET_PROPERTIES: return this._getProperties(peer, params);
+                case OPS.GET_REGIONS: return this._getRegions(peer, params);
+                case OPS.GET_GAME_LIST: return this._getGameList(peer, params);
+                case OPS.SERVER_SETTINGS: return this._serverSettings(peer, params);
+                default:
+                    logger.warn('Unknown operation', { peerId: peer.peerId, opCode });
+                    peer.sendOperationResponse(opCode, RC.OPERATION_INVALID, {},
+                        `Unknown operation code: ${opCode}`);
+            }
+        } catch (error) {
+            logger.error('Operation failed', {
                 peerId: peer.peerId,
                 opCode,
-                parameterKeys: Object.keys(parameters)
+                error: error.message,
+                stack: error.stack
             });
-
-            const handler = this._operationHandlers.get(opCode);
-            if (!handler) {
-                this._handleUnknownOperation(peer, opCode);
-                return;
-            }
-
-            await handler(peer, parameters);
-
-        } catch (error) {
-            this._handleOperationError(peer, operation, error);
+            peer.sendOperationResponse(opCode, RC.INTERNAL_SERVER_ERROR, {},
+                'Internal server error');
         }
     }
 
-    /**
-     * Validate operation structure
-     * @private
-     * @param {Object} operation - Operation to validate
-     * @throws {Error} If operation is invalid
-     */
-    _validateOperation(operation) {
-        if (!operation || typeof operation !== 'object') {
-            throw new Error('Invalid operation structure');
-        }
+    // ------------------------------------------------------------------
+    // Authentication
+    // ------------------------------------------------------------------
 
-        const opCode = operation.OperationCode || operation.Code;
-        if (typeof opCode !== 'number') {
-            throw new Error('Operation code must be a number');
-        }
-    }
+    _authenticate(peer, params) {
+        const appVersion = raw(params[P.APP_VERSION]);
+        const userId = raw(params[P.USER_ID]) || `user_${peer.peerId}`;
+        const secret = raw(params[P.SECRET]);
 
-    /**
-     * Validate peer instance
-     * @private
-     * @param {PhotonPeer} peer - Peer to validate
-     * @throws {Error} If peer is invalid
-     */
-    _validatePeer(peer) {
-        if (!peer || typeof peer.peerId === 'undefined') {
-            throw new Error('Invalid peer instance');
-        }
-    }
+        // A token in the auth request means this is the game-server phase
+        // of the connect flow (client reconnected after our redirect).
+        peer.authenticate('', userId, {
+            appVersion,
+            authType: raw(params[P.CLIENT_AUTHENTICATION_TYPE]),
+            authParams: raw(params[P.CLIENT_AUTHENTICATION_PARAMS]),
+            authData: raw(params[P.CLIENT_AUTHENTICATION_DATA])
+        }, secret || null);
 
-    /**
-     * Handle unknown operation codes
-     * @private
-     * @param {PhotonPeer} peer - The peer that sent the operation
-     * @param {number} opCode - The unknown operation code
-     */
-    _handleUnknownOperation(peer, opCode) {
-        logger.warn(`Unknown operation ${opCode} from peer ${peer.peerId}`);
-        
-        peer.sendOperationResponse(opCode, PHOTON_RETURN_CODES.OPERATION_INVALID, {
-            DebugMessage: `Unsupported operation: ${opCode}`
-        });
-    }
-
-    /**
-     * Handle operation processing errors
-     * @private
-     * @param {PhotonPeer} peer - The peer that sent the operation
-     * @param {Object} operation - The operation that failed
-     * @param {Error} error - The error that occurred
-     */
-    _handleOperationError(peer, operation, error) {
-        const opCode = operation?.OperationCode || operation?.Code || 'unknown';
-        
-        logger.error(`Error processing operation ${opCode} from peer ${peer?.peerId}`, {
-            peerId: peer?.peerId,
-            opCode,
-            error: error.message,
-            stack: error.stack
-        });
-
-        if (peer && typeof peer.sendOperationResponse === 'function') {
-            peer.sendOperationResponse(opCode, PHOTON_RETURN_CODES.PLUGIN_REPORTED_ERROR, {
-                DebugMessage: 'Internal server error occurred'
-            });
-        }
-    }
-
-    /**
-     * Handle peer authentication
-     * @private
-     * @param {PhotonPeer} peer - The authenticating peer
-     * @param {Object} parameters - Authentication parameters
-     */
-    async _handleAuthentication(peer, parameters) {
-        const { nickname, userId, authData } = this._extractAuthParams(parameters);
-
-        try {
-            const isValid = await this._validateAuthentication(userId, authData);
-            
-            if (!isValid) {
-                peer.sendOperationResponse(PHOTON_OPERATIONS.AUTHENTICATE, PHOTON_RETURN_CODES.OPERATION_INVALID, {
-                    DebugMessage: 'Authentication credentials invalid'
-                });
-                return;
-            }
-
-            peer.authenticate(nickname, userId, authData);
-            
-            logger.info(`Peer authenticated successfully`, {
-                peerId: peer.peerId,
-                nickname,
-                userId
-            });
-
-            peer.sendOperationResponse(PHOTON_OPERATIONS.AUTHENTICATE, PHOTON_RETURN_CODES.OK, {
-                nickname,
-                userId
-            });
-
-        } catch (error) {
-            logger.error('Authentication error', { peerId: peer.peerId, error: error.message });
-            throw error;
-        }
-    }
-
-    /**
-     * Extract authentication parameters with defaults
-     * @private
-     * @param {Object} parameters - Raw parameters
-     * @returns {Object} Normalized auth parameters
-     */
-    _extractAuthParams(parameters) {
-        return {
-            nickname: parameters.nickName || parameters.NickName || `Guest_${Date.now()}`,
-            userId: parameters.userId || parameters.UserId || `user_${Date.now()}`,
-            authData: parameters.authData || parameters.AuthData
+        const responseParams = {
+            [P.USER_ID]: T.string(peer.userId),
+            [P.SECRET]: T.string(secret || this._makeToken(peer))
         };
+
+        logger.info('Peer authenticated', {
+            peerId: peer.peerId,
+            userId: peer.userId,
+            appVersion,
+            phase: peer.onGameServer ? 'game-server' : 'master'
+        });
+
+        peer.sendOperationResponse(OPS.AUTHENTICATE, RC.OK, responseParams);
     }
 
-    /**
-     * Handle room joining requests
-     * @private
-     * @param {PhotonPeer} peer - The peer requesting to join
-     * @param {Object} parameters - Join parameters
-     */
-    async _handleJoinRoom(peer, parameters) {
+    _makeToken(peer) {
+        return crypto.randomBytes(16).toString('hex');
+    }
+
+    // ------------------------------------------------------------------
+    // Lobby
+    // ------------------------------------------------------------------
+
+    _joinLobby(peer, params) {
+        peer.sendOperationResponse(OPS.JOIN_LOBBY, RC.OK);
+
+        // Send the current room list as a GameList event
+        const gameList = new Map();
+        for (const room of this.server.getVisibleRooms()) {
+            gameList.set(room.name, this._roomListEntry(room));
+        }
+        peer.sendEvent(EV.GAME_LIST, { [P.GAME_LIST]: T.hashtable(gameList) });
+    }
+
+    _leaveLobby(peer, params) {
+        peer.sendOperationResponse(OPS.LEAVE_LOBBY, RC.OK);
+    }
+
+    _roomListEntry(room) {
+        const entry = new Map();
+        entry.set(GPK.MAX_PLAYERS, T.byte(room.maxPlayers));
+        entry.set(GPK.IS_OPEN, room.isOpen);
+        entry.set(GPK.IS_VISIBLE, room.isVisible);
+        entry.set(APK.USER_ID, T.byte(room.getPeerCount())); // PlayerCount key 252? kept simple
+        for (const [key, value] of Object.entries(room.customProperties || {})) {
+            entry.set(key, value);
+        }
+        return T.hashtable(entry);
+    }
+
+    _getGameList(peer, params) {
+        const gameList = new Map();
+        for (const room of this.server.getVisibleRooms()) {
+            gameList.set(room.name, this._roomListEntry(room));
+        }
+        peer.sendOperationResponse(OPS.GET_GAME_LIST, RC.OK, {
+            [P.GAME_LIST]: T.hashtable(gameList)
+        });
+    }
+
+    _getRegions(peer, params) {
+        peer.sendOperationResponse(OPS.GET_REGIONS, RC.OK, {
+            [P.REGION]: T.stringArray(['us']),
+            [P.ADDRESS]: T.stringArray([this.server.getPublicAddress()])
+        });
+    }
+
+    _serverSettings(peer, params) {
+        peer.sendOperationResponse(OPS.SERVER_SETTINGS, RC.OK);
+    }
+
+    // ------------------------------------------------------------------
+    // Room create / join
+    // ------------------------------------------------------------------
+
+    _createOrJoinGame(peer, opCode, params) {
         if (!peer.isAuthenticated()) {
-            peer.sendOperationResponse(PHOTON_OPERATIONS.JOIN_ROOM, PHOTON_RETURN_CODES.OPERATION_NOT_ALLOWED_IN_CURRENT_STATE, {
-                DebugMessage: 'Authentication required before joining rooms'
-            });
+            peer.sendOperationResponse(opCode, RC.OPERATION_NOT_ALLOWED_IN_CURRENT_STATE, {},
+                'Authenticate first');
             return;
         }
 
-        const roomName = parameters.RoomName || parameters.GameId;
-        if (!roomName) {
-            peer.sendOperationResponse(PHOTON_OPERATIONS.JOIN_ROOM, PHOTON_RETURN_CODES.OPERATION_INVALID, {
-                DebugMessage: 'Room name is required'
+        const roomName = raw(params[P.GAME_ID]) ||
+            `Room_${crypto.randomBytes(4).toString('hex')}`;
+        const joinMode = raw(params[P.JOIN_MODE]) || 0;
+        const createIfNotExists = opCode === OPS.CREATE_GAME || joinMode >= 1;
+
+        // Master phase: validate and redirect to the game server (ourselves)
+        if (!peer.onGameServer) {
+            const room = this.server.getRoom(roomName);
+
+            if (opCode === OPS.JOIN_GAME && !room && !createIfNotExists) {
+                peer.sendOperationResponse(opCode, RC.GAME_DOES_NOT_EXIST, {},
+                    'Game does not exist');
+                return;
+            }
+            if (opCode === OPS.CREATE_GAME && room && joinMode === 0) {
+                peer.sendOperationResponse(opCode, RC.GAME_ID_ALREADY_EXISTS, {},
+                    'A game with this name already exists');
+                return;
+            }
+            if (room && (!room.isOpen || room.isFull())) {
+                peer.sendOperationResponse(opCode,
+                    room.isOpen ? RC.GAME_FULL : RC.GAME_CLOSED, {},
+                    room.isOpen ? 'Game full' : 'Game closed');
+                return;
+            }
+
+            peer.sendOperationResponse(opCode, RC.OK, {
+                [P.GAME_ID]: T.string(roomName),
+                [P.ADDRESS]: T.string(this.server.getPublicAddress()),
+                [P.SECRET]: T.string(this._makeToken(peer))
             });
-            return;
-        }
 
-        const joinResult = await this._processRoomJoin(peer, roomName, parameters);
-        this._sendJoinResponse(peer, joinResult);
-    }
-
-    /**
-     * Process room join logic
-     * @private
-     * @param {PhotonPeer} peer - The joining peer
-     * @param {string} roomName - Name of room to join
-     * @param {Object} parameters - Join parameters
-     * @returns {Object} Join result
-     */
-    async _processRoomJoin(peer, roomName, parameters) {
-        try {
-            let room = this.server.getRoom(roomName);
-            
-            if (!room) {
-                room = await this._createRoomForJoin(roomName, parameters);
-            }
-
-            if (!this._validateRoomAccess(room, parameters.password || parameters.Password)) {
-                return {
-                    success: false,
-                    code: PHOTON_RETURN_CODES.JOIN_FAILED_DENIED,
-                    message: 'Invalid room credentials'
-                };
-            }
-
-            const joinSuccessful = room.addPeer(peer);
-            if (!joinSuccessful) {
-                return {
-                    success: false,
-                    code: room.isOpen ? PHOTON_RETURN_CODES.ROOM_FULL : PHOTON_RETURN_CODES.ROOM_CLOSED,
-                    message: room.isOpen ? 'Room is at capacity' : 'Room is closed to new players'
-                };
-            }
-
-            logger.info(`Peer joined room successfully`, {
+            logger.info('Redirecting peer to game server', {
                 peerId: peer.peerId,
                 roomName,
-                playerCount: room.peers.size
+                address: this.server.getPublicAddress()
             });
-
-            return {
-                success: true,
-                code: PHOTON_RETURN_CODES.OK,
-                room
-            };
-
-        } catch (error) {
-            logger.error('Room join error', { peerId: peer.peerId, roomName, error: error.message });
-            return {
-                success: false,
-                code: PHOTON_RETURN_CODES.PLUGIN_REPORTED_ERROR,
-                message: 'Unable to process room join request'
-            };
+            return;
         }
+
+        // Game-server phase: actually enter the room
+        this._enterRoom(peer, opCode, roomName, params, createIfNotExists);
     }
 
-    /**
-     * Create room for join operation
-     * @private
-     * @param {string} roomName - Room name
-     * @param {Object} parameters - Room parameters
-     * @returns {PhotonRoom} Created room
-     */
-    async _createRoomForJoin(roomName, parameters) {
-        const roomOptions = {
-            maxPlayers: Math.max(1, Math.min(parameters.MaxPlayers || 4, 100)),
-            isOpen: parameters.IsOpen !== false,
-            isVisible: parameters.IsVisible !== false,
-            customProperties: parameters.GameProperties || {},
-            password: parameters.password || parameters.Password
+    _enterRoom(peer, opCode, roomName, params, createIfNotExists) {
+        if (peer.room) {
+            peer.sendOperationResponse(opCode, RC.ALREADY_JOINED, {}, 'Already in a room');
+            return;
+        }
+
+        let room = this.server.getRoom(roomName);
+
+        if (!room) {
+            if (!createIfNotExists) {
+                peer.sendOperationResponse(opCode, RC.GAME_DOES_NOT_EXIST, {},
+                    'Game does not exist');
+                return;
+            }
+            room = this.server.createRoom(roomName, this._roomOptionsFromParams(params));
+        } else if (opCode === OPS.CREATE_GAME && (raw(params[P.JOIN_MODE]) || 0) === 0) {
+            peer.sendOperationResponse(opCode, RC.GAME_ID_ALREADY_EXISTS, {},
+                'A game with this name already exists');
+            return;
+        }
+
+        // Actor properties sent by the client (nickname etc.)
+        const actorProps = raw(params[P.ACTOR_PROPERTIES]);
+        if (actorProps instanceof Map) {
+            peer.actorProperties = actorProps;
+            const nick = raw(actorProps.get(APK.NICKNAME));
+            if (typeof nick === 'string') peer.setNickname(nick);
+        }
+
+        if (!room.addPeer(peer)) {
+            peer.sendOperationResponse(opCode,
+                room.isFull() ? RC.GAME_FULL : RC.GAME_CLOSED, {},
+                'Unable to join game');
+            return;
+        }
+
+        // Merge game properties provided on create
+        const gameProps = raw(params[P.GAME_PROPERTIES]);
+        if (gameProps instanceof Map) {
+            this._applyWellKnownGameProps(room, gameProps);
+        }
+
+        const actors = this._actorNumbers(room);
+
+        peer.sendOperationResponse(opCode, RC.OK, {
+            [P.ACTOR_NR]: T.int(peer.actorNr),
+            [P.ACTORS]: T.intArray(actors),
+            [P.ACTOR_PROPERTIES]: T.hashtable(this._actorPropertiesTable(room)),
+            [P.GAME_PROPERTIES]: T.hashtable(this._gamePropertiesTable(room))
+        });
+
+        // Join event to everyone in the room (including the joiner)
+        const joinEvent = {
+            [P.ACTOR_NR]: T.int(peer.actorNr),
+            [P.ACTORS]: T.intArray(actors),
+            [P.ACTOR_PROPERTIES]: T.hashtable(peer.actorProperties || new Map())
         };
+        for (const member of room.getPeers()) {
+            member.sendEvent(EV.JOIN, joinEvent);
+        }
 
-        return this.server.createRoom(roomName, roomOptions);
-    }
+        // Replay cached events to the new joiner
+        room.replayCachedEvents(peer);
 
-    /**
-     * Validate room access permissions
-     * @private
-     * @param {PhotonRoom} room - Room to validate
-     * @param {string} password - Provided password
-     * @returns {boolean} Access granted
-     */
-    _validateRoomAccess(room, password) {
-        return room.validatePassword(password);
-    }
-
-    /**
-     * Send join response to peer
-     * @private
-     * @param {PhotonPeer} peer - Target peer
-     * @param {Object} result - Join result
-     */
-    _sendJoinResponse(peer, result) {
-        peer.sendOperationResponse(PHOTON_OPERATIONS.JOIN_ROOM, result.code, {
-            DebugMessage: result.message || (result.success ? 'Successfully joined room' : 'Failed to join room')
+        logger.info('Peer entered room', {
+            peerId: peer.peerId,
+            actorNr: peer.actorNr,
+            roomName,
+            playerCount: room.getPeerCount()
         });
     }
 
-    /**
-     * Handle room leaving requests
-     * @private
-     * @param {PhotonPeer} peer - The peer leaving
-     * @param {Object} parameters - Leave parameters
-     */
-    async _handleLeaveRoom(peer, parameters) {
+    _joinRandomGame(peer, params) {
+        if (!peer.isAuthenticated()) {
+            peer.sendOperationResponse(OPS.JOIN_RANDOM_GAME, RC.OPERATION_NOT_ALLOWED_IN_CURRENT_STATE,
+                {}, 'Authenticate first');
+            return;
+        }
+
+        const filter = raw(params[P.GAME_PROPERTIES]);
+        const candidates = this.server.getVisibleRooms().filter((room) =>
+            room.isOpen && !room.isFull() && this._matchesFilter(room, filter));
+
+        if (candidates.length === 0) {
+            peer.sendOperationResponse(OPS.JOIN_RANDOM_GAME, RC.NO_RANDOM_MATCH_FOUND, {},
+                'No match found');
+            return;
+        }
+
+        const room = candidates[Math.floor(Math.random() * candidates.length)];
+        peer.sendOperationResponse(OPS.JOIN_RANDOM_GAME, RC.OK, {
+            [P.GAME_ID]: T.string(room.name),
+            [P.ADDRESS]: T.string(this.server.getPublicAddress()),
+            [P.SECRET]: T.string(this._makeToken(peer))
+        });
+    }
+
+    _matchesFilter(room, filter) {
+        if (!(filter instanceof Map) || filter.size === 0) return true;
+        const props = room.customProperties || {};
+        for (const [key, value] of filter.entries()) {
+            if (props[key] !== raw(value)) return false;
+        }
+        return true;
+    }
+
+    _roomOptionsFromParams(params) {
+        const options = { maxPlayers: 0, customProperties: {} };
+
+        const gameProps = raw(params[P.GAME_PROPERTIES]);
+        if (gameProps instanceof Map) {
+            for (const [key, value] of gameProps.entries()) {
+                switch (key) {
+                    case GPK.MAX_PLAYERS: options.maxPlayers = raw(value); break;
+                    case GPK.IS_OPEN: options.isOpen = !!raw(value); break;
+                    case GPK.IS_VISIBLE: options.isVisible = !!raw(value); break;
+                    case GPK.PROPS_LISTED_IN_LOBBY: break;
+                    default:
+                        if (typeof key === 'string') options.customProperties[key] = value;
+                }
+            }
+        }
+
+        const playerTtl = raw(params[P.PLAYER_TTL]);
+        const emptyRoomTtl = raw(params[P.EMPTY_ROOM_TTL]);
+        if (typeof playerTtl === 'number') options.playerTtl = Math.max(0, playerTtl);
+        if (typeof emptyRoomTtl === 'number' && emptyRoomTtl > 0) options.emptyRoomTtl = emptyRoomTtl;
+        if (!options.maxPlayers || options.maxPlayers <= 0) options.maxPlayers = 100;
+
+        return options;
+    }
+
+    _applyWellKnownGameProps(room, gameProps) {
+        const custom = {};
+        for (const [key, value] of gameProps.entries()) {
+            if (typeof key === 'string') custom[key] = value;
+        }
+        if (Object.keys(custom).length > 0) {
+            room.setCustomProperties(custom, false);
+        }
+    }
+
+    _actorNumbers(room) {
+        return room.getPeers().map(p => p.actorNr).sort((a, b) => a - b);
+    }
+
+    _actorPropertiesTable(room) {
+        const table = new Map();
+        for (const member of room.getPeers()) {
+            const props = new Map(member.actorProperties || []);
+            if (member.playerName && !props.has(APK.NICKNAME)) {
+                props.set(APK.NICKNAME, member.playerName);
+            }
+            table.set(T.int(member.actorNr), T.hashtable(props));
+        }
+        return table;
+    }
+
+    _gamePropertiesTable(room) {
+        const table = new Map();
+        table.set(GPK.MAX_PLAYERS, T.byte(Math.min(255, room.maxPlayers)));
+        table.set(GPK.IS_OPEN, !!room.isOpen);
+        table.set(GPK.IS_VISIBLE, !!room.isVisible);
+        table.set(GPK.MASTER_CLIENT_ID, T.int(this._masterActorNr(room)));
+        for (const [key, value] of Object.entries(room.customProperties || {})) {
+            table.set(key, value);
+        }
+        return table;
+    }
+
+    _masterActorNr(room) {
+        const actors = this._actorNumbers(room);
+        return actors.length > 0 ? actors[0] : 0;
+    }
+
+    // ------------------------------------------------------------------
+    // Leave
+    // ------------------------------------------------------------------
+
+    _leave(peer, params) {
         if (!peer.room) {
-            peer.sendOperationResponse(PHOTON_OPERATIONS.LEAVE_ROOM, PHOTON_RETURN_CODES.OPERATION_NOT_ALLOWED_IN_CURRENT_STATE, {
-                DebugMessage: 'Not currently in a room'
-            });
+            peer.sendOperationResponse(OPS.LEAVE, RC.OPERATION_NOT_ALLOWED_IN_CURRENT_STATE,
+                {}, 'Not in a room');
             return;
         }
 
         const roomName = peer.room.name;
-        const wasEmpty = peer.leaveRoom();
+        const wasEmpty = peer.leaveRoom('Client left');
+        peer.sendOperationResponse(OPS.LEAVE, RC.OK);
 
         if (wasEmpty) {
             this.server.removeRoom(roomName);
-            logger.info(`Empty room removed`, { roomName });
-        }
-
-        peer.sendOperationResponse(PHOTON_OPERATIONS.LEAVE_ROOM, PHOTON_RETURN_CODES.OK);
-        
-        logger.info(`Peer left room`, {
-            peerId: peer.peerId,
-            roomName
-        });
-    }
-
-    /**
-     * Handle property change requests
-     * @private
-     * @param {PhotonPeer} peer - The requesting peer
-     * @param {Object} parameters - Property parameters
-     */
-    async _handleChangeProperties(peer, parameters) {
-        const actorProperties = parameters.actorProperties || parameters.ActorProperties;
-        const gameProperties = parameters.gameProperties || parameters.GameProperties;
-        const broadcast = parameters.broadcast !== false;
-
-        try {
-            if (actorProperties && Object.keys(actorProperties).length > 0) {
-                peer.setCustomProperties(actorProperties, broadcast);
-            }
-
-            if (gameProperties && Object.keys(gameProperties).length > 0) {
-                if (!peer.room) {
-                    peer.sendOperationResponse(PHOTON_OPERATIONS.CHANGE_PROPERTIES, PHOTON_RETURN_CODES.OPERATION_NOT_ALLOWED_IN_CURRENT_STATE, {
-                        DebugMessage: 'Must be in a room to change game properties'
-                    });
-                    return;
-                }
-
-                if (!peer.isMasterClient) {
-                    peer.sendOperationResponse(PHOTON_OPERATIONS.CHANGE_PROPERTIES, PHOTON_RETURN_CODES.OPERATION_NOT_ALLOWED_IN_CURRENT_STATE, {
-                        DebugMessage: 'Only master client can change game properties'
-                    });
-                    return;
-                }
-
-                peer.room.setCustomProperties(gameProperties, broadcast);
-            }
-
-            peer.sendOperationResponse(PHOTON_OPERATIONS.CHANGE_PROPERTIES, PHOTON_RETURN_CODES.OK);
-
-        } catch (error) {
-            logger.error('Property change error', { peerId: peer.peerId, error: error.message });
-            throw error;
         }
     }
 
-    /**
-     * Handle room list requests
-     * @private
-     * @param {PhotonPeer} peer - The requesting peer
-     * @param {Object} parameters - Request parameters
-     */
-    async _handleGetRooms(peer, parameters) {
-        try {
-            const rooms = this.server.getVisibleRooms();
-            const roomList = rooms.map(room => this._serializeRoomInfo(room));
+    // ------------------------------------------------------------------
+    // RaiseEvent
+    // ------------------------------------------------------------------
 
-            peer.sendOperationResponse(PHOTON_OPERATIONS.GET_ROOMS, PHOTON_RETURN_CODES.OK, {
-                roomList
-            });
-
-            logger.debug(`Room list sent to peer`, {
-                peerId: peer.peerId,
-                roomCount: roomList.length
-            });
-
-        } catch (error) {
-            logger.error('Get rooms error', { peerId: peer.peerId, error: error.message });
-            throw error;
-        }
-    }
-
-    /**
-     * Serialize room information for client
-     * @private
-     * @param {PhotonRoom} room - Room to serialize
-     * @returns {Object} Serialized room data
-     */
-    _serializeRoomInfo(room) {
-        return {
-            name: room.name,
-            playerCount: room.peers.size,
-            maxPlayers: room.maxPlayers,
-            isOpen: room.isOpen,
-            isVisible: room.isVisible,
-            customProperties: { ...room.customProperties }
-        };
-    }
-
-    /**
-     * Handle event raising requests
-     * @private
-     * @param {PhotonPeer} peer - The peer raising the event
-     * @param {Object} parameters - Event parameters
-     */
-    async _handleRaiseEvent(peer, parameters) {
-        if (!peer.room) {
-            peer.sendOperationResponse(PHOTON_OPERATIONS.RAISE_EVENT, PHOTON_RETURN_CODES.OPERATION_NOT_ALLOWED_IN_CURRENT_STATE, {
-                DebugMessage: 'Must be in a room to raise events'
-            });
+    _raiseEvent(peer, params) {
+        const room = peer.room;
+        if (!room) {
+            peer.sendOperationResponse(OPS.RAISE_EVENT, RC.OPERATION_NOT_ALLOWED_IN_CURRENT_STATE,
+                {}, 'Not in a room');
             return;
         }
 
-        const eventCode = parameters.Code || parameters.EventCode;
+        const eventCode = raw(params[P.CODE]);
         if (typeof eventCode !== 'number') {
-            peer.sendOperationResponse(PHOTON_OPERATIONS.RAISE_EVENT, PHOTON_RETURN_CODES.OPERATION_INVALID, {
-                DebugMessage: 'Event code must be a number'
-            });
+            peer.sendOperationResponse(OPS.RAISE_EVENT, RC.OPERATION_INVALID, {},
+                'Missing event code');
             return;
         }
 
-        try {
-            const eventData = parameters.Data || parameters.EventData || {};
-            const targetPeers = parameters.TargetActors || parameters.targetActors;
-            const cacheEvent = Boolean(parameters.CacheEvent);
+        const cache = raw(params[P.CACHE]) || 0;
+        const receiverGroup = raw(params[P.RECEIVER_GROUP]) || RECEIVER_GROUPS.OTHERS;
+        const targetActors = raw(params[P.ACTORS]);
 
-            const success = peer.room.raiseEvent(peer, eventCode, eventData, targetPeers, cacheEvent);
-            
-            if (success) {
-                peer.sendOperationResponse(PHOTON_OPERATIONS.RAISE_EVENT, PHOTON_RETURN_CODES.OK);
-                logger.debug(`Event raised successfully`, {
-                    peerId: peer.peerId,
-                    eventCode,
-                    roomName: peer.room.name
-                });
-            } else {
-                peer.sendOperationResponse(PHOTON_OPERATIONS.RAISE_EVENT, PHOTON_RETURN_CODES.OPERATION_INVALID, {
-                    DebugMessage: 'Event could not be processed'
-                });
-            }
-
-        } catch (error) {
-            logger.error('Raise event error', { peerId: peer.peerId, eventCode, error: error.message });
-            throw error;
+        const eventParams = { [P.ACTOR_NR]: T.int(peer.actorNr) };
+        if (params[P.DATA] !== undefined) {
+            eventParams[P.DATA] = params[P.DATA]; // typed, round-trips exactly
         }
+
+        // Event cache for late joiners
+        switch (cache) {
+            case EVENT_CACHING.ADD_TO_ROOM_CACHE:
+            case EVENT_CACHING.ADD_TO_ROOM_CACHE_GLOBAL:
+            case EVENT_CACHING.MERGE_CACHE:
+            case EVENT_CACHING.REPLACE_CACHE:
+                room.cacheRoomEvent(peer.actorNr, eventCode, eventParams,
+                    cache === EVENT_CACHING.ADD_TO_ROOM_CACHE_GLOBAL);
+                break;
+            case EVENT_CACHING.REMOVE_CACHE:
+            case EVENT_CACHING.REMOVE_FROM_ROOM_CACHE:
+                room.removeCachedEvents(peer.actorNr, eventCode);
+                break;
+        }
+
+        // Route
+        let targets;
+        if (Array.isArray(targetActors) && targetActors.length > 0) {
+            const set = new Set(targetActors);
+            targets = room.getPeers().filter(p => set.has(p.actorNr));
+        } else if (receiverGroup === RECEIVER_GROUPS.ALL) {
+            targets = room.getPeers();
+        } else if (receiverGroup === RECEIVER_GROUPS.MASTER_CLIENT) {
+            const masterNr = this._masterActorNr(room);
+            targets = room.getPeers().filter(p => p.actorNr === masterNr);
+        } else {
+            targets = room.getPeers().filter(p => p !== peer);
+        }
+
+        for (const target of targets) {
+            target.sendEvent(eventCode, eventParams);
+        }
+
+        // RaiseEvent has no operation response on success.
     }
 
-    /**
-     * Handle room creation requests
-     * @private
-     * @param {PhotonPeer} peer - The peer creating the room
-     * @param {Object} parameters - Creation parameters
-     */
-    async _handleCreateRoom(peer, parameters) {
-        if (!peer.isAuthenticated()) {
-            peer.sendOperationResponse(PHOTON_OPERATIONS.CREATE_ROOM, PHOTON_RETURN_CODES.OPERATION_NOT_ALLOWED_IN_CURRENT_STATE, {
-                DebugMessage: 'Authentication required before creating rooms'
-            });
+    // ------------------------------------------------------------------
+    // Properties
+    // ------------------------------------------------------------------
+
+    _setProperties(peer, params) {
+        const room = peer.room;
+        if (!room) {
+            peer.sendOperationResponse(OPS.SET_PROPERTIES, RC.OPERATION_NOT_ALLOWED_IN_CURRENT_STATE,
+                {}, 'Not in a room');
             return;
         }
 
-        const roomName = parameters.RoomName || parameters.GameId || `Room_${Date.now()}_${peer.peerId}`;
-        
-        if (this.server.getRoom(roomName)) {
-            peer.sendOperationResponse(PHOTON_OPERATIONS.CREATE_ROOM, PHOTON_RETURN_CODES.ROOM_NOT_FOUND, {
-                DebugMessage: 'Room name already exists'
-            });
+        const properties = raw(params[P.PROPERTIES]);
+        const targetActorNr = raw(params[P.ACTOR_NR]);
+        const broadcast = params[P.BROADCAST] === undefined ? true : !!raw(params[P.BROADCAST]);
+
+        if (!(properties instanceof Map)) {
+            peer.sendOperationResponse(OPS.SET_PROPERTIES, RC.OPERATION_INVALID, {},
+                'Missing properties');
             return;
         }
 
-        try {
-            const roomOptions = this._buildRoomOptions(parameters);
-            const room = this.server.createRoom(roomName, roomOptions);
-            
-            const joinSuccessful = room.addPeer(peer);
-            if (!joinSuccessful) {
-                this.server.removeRoom(roomName);
-                peer.sendOperationResponse(PHOTON_OPERATIONS.CREATE_ROOM, PHOTON_RETURN_CODES.PLUGIN_REPORTED_ERROR, {
-                    DebugMessage: 'Failed to join newly created room'
-                });
+        if (typeof targetActorNr === 'number' && targetActorNr > 0) {
+            // Actor properties
+            const target = room.getPeers().find(p => p.actorNr === targetActorNr);
+            if (!target) {
+                peer.sendOperationResponse(OPS.SET_PROPERTIES, RC.OPERATION_INVALID, {},
+                    'Actor not found');
                 return;
             }
+            for (const [key, value] of properties.entries()) {
+                target.actorProperties.set(key, value);
+                if (key === APK.NICKNAME) target.setNickname(raw(value));
+            }
+        } else {
+            // Game properties
+            this._applyWellKnownGameProps(room, properties);
+            const maxPlayers = properties.get(GPK.MAX_PLAYERS);
+            if (maxPlayers !== undefined) room.setMaxPlayers?.(raw(maxPlayers));
+        }
 
-            peer.sendOperationResponse(PHOTON_OPERATIONS.CREATE_ROOM, PHOTON_RETURN_CODES.OK);
-            
-            logger.info(`Room created and joined`, {
-                peerId: peer.peerId,
-                roomName,
-                maxPlayers: room.maxPlayers
-            });
+        peer.sendOperationResponse(OPS.SET_PROPERTIES, RC.OK);
 
-        } catch (error) {
-            logger.error('Create room error', { peerId: peer.peerId, roomName, error: error.message });
-            throw error;
+        if (broadcast) {
+            const eventParams = {
+                [P.ACTOR_NR]: T.int(peer.actorNr),
+                [P.TARGET_ACTOR_NR]: T.int(typeof targetActorNr === 'number' ? targetActorNr : 0),
+                [P.PROPERTIES]: T.hashtable(properties)
+            };
+            for (const member of room.getPeers()) {
+                if (member !== peer) member.sendEvent(EV.PROPERTIES_CHANGED, eventParams);
+            }
         }
     }
 
-    /**
-     * Build room options from parameters
-     * @private
-     * @param {Object} parameters - Creation parameters
-     * @returns {Object} Room options
-     */
-    _buildRoomOptions(parameters) {
-        return {
-            maxPlayers: Math.max(1, Math.min(parameters.MaxPlayers || 4, 100)),
-            isOpen: parameters.IsOpen !== false,
-            isVisible: parameters.IsVisible !== false,
-            customProperties: parameters.GameProperties || {},
-            password: parameters.password || parameters.Password
-        };
-    }
-
-    /**
-     * Handle random room join requests
-     * @private
-     * @param {PhotonPeer} peer - The peer requesting random join
-     * @param {Object} parameters - Join parameters
-     */
-    async _handleJoinRandomRoom(peer, parameters) {
-        if (!peer.isAuthenticated()) {
-            peer.sendOperationResponse(PHOTON_OPERATIONS.JOIN_RANDOM_ROOM, PHOTON_RETURN_CODES.OPERATION_NOT_ALLOWED_IN_CURRENT_STATE, {
-                DebugMessage: 'Authentication required before joining rooms'
-            });
+    _getProperties(peer, params) {
+        const room = peer.room;
+        if (!room) {
+            peer.sendOperationResponse(OPS.GET_PROPERTIES, RC.OPERATION_NOT_ALLOWED_IN_CURRENT_STATE,
+                {}, 'Not in a room');
             return;
         }
 
-        try {
-            const availableRooms = this._findMatchingRooms(parameters);
-            
-            if (availableRooms.length === 0) {
-                peer.sendOperationResponse(PHOTON_OPERATIONS.JOIN_RANDOM_ROOM, PHOTON_RETURN_CODES.ROOM_NOT_FOUND, {
-                    DebugMessage: 'No suitable rooms available'
-                });
-                return;
-            }
-
-            const selectedRoom = this._selectRandomRoom(availableRooms);
-            const joinSuccessful = selectedRoom.addPeer(peer);
-            
-            if (joinSuccessful) {
-                peer.sendOperationResponse(PHOTON_OPERATIONS.JOIN_RANDOM_ROOM, PHOTON_RETURN_CODES.OK);
-                logger.info(`Peer joined random room`, {
-                    peerId: peer.peerId,
-                    roomName: selectedRoom.name
-                });
-            } else {
-                peer.sendOperationResponse(PHOTON_OPERATIONS.JOIN_RANDOM_ROOM, PHOTON_RETURN_CODES.ROOM_FULL, {
-                    DebugMessage: 'Selected room became unavailable'
-                });
-            }
-
-        } catch (error) {
-            logger.error('Join random room error', { peerId: peer.peerId, error: error.message });
-            throw error;
-        }
-    }
-
-    /**
-     * Find rooms matching join criteria
-     * @private
-     * @param {Object} parameters - Filter parameters
-     * @returns {PhotonRoom[]} Matching rooms
-     */
-    _findMatchingRooms(parameters) {
-        const maxPlayers = parameters.MaxPlayers;
-        const customProperties = parameters.GameProperties || {};
-        
-        return this.server.getVisibleRooms().filter(room => {
-            return room.isOpen && 
-                   !room.isFull() && 
-                   (!maxPlayers || room.maxPlayers <= maxPlayers) &&
-                   this._matchesCustomProperties(room.customProperties, customProperties);
+        peer.sendOperationResponse(OPS.GET_PROPERTIES, RC.OK, {
+            [P.ACTOR_PROPERTIES]: T.hashtable(this._actorPropertiesTable(room)),
+            [P.GAME_PROPERTIES]: T.hashtable(this._gamePropertiesTable(room))
         });
-    }
-
-    /**
-     * Select random room from available options
-     * @private
-     * @param {PhotonRoom[]} rooms - Available rooms
-     * @returns {PhotonRoom} Selected room
-     */
-    _selectRandomRoom(rooms) {
-        const randomIndex = Math.floor(Math.random() * rooms.length);
-        return rooms[randomIndex];
-    }
-
-    /**
-     * Handle room list requests (alias for getrooms)
-     * @private
-     * @param {PhotonPeer} peer - The requesting peer
-     * @param {Object} parameters - Request parameters
-     */
-    async _handleGetRoomList(peer, parameters) {
-        return this._handleGetRooms(peer, parameters);
-    }
-
-    /**
-     * Validate authentication credentials
-     * @private
-     * @param {string} userId - User identifier
-     * @param {*} authData - Authentication data
-     * @returns {Promise<boolean>} Authentication result
-     */
-    async _validateAuthentication(userId, authData) {
-        // TODO: Implement proper authentication logic
-        // This should validate against your authentication system
-        
-        // Basic validation
-        if (!userId || typeof userId !== 'string' || userId.length === 0) {
-            return false;
-        }
-
-        // Additional validation can be added here
-        return true;
-    }
-
-    /**
-     * Check if room properties match filter criteria
-     * @private
-     * @param {Object} roomProperties - Room's custom properties
-     * @param {Object} filterProperties - Required properties
-     * @returns {boolean} Properties match
-     */
-    _matchesCustomProperties(roomProperties, filterProperties) {
-        return Object.entries(filterProperties).every(([key, value]) => 
-            roomProperties[key] === value
-        );
     }
 }
 

@@ -1,5 +1,6 @@
-const { PHOTON_EVENTS, PHOTON_OPERATIONS, PHOTON_RETURN_CODES } = require('../protocol/constants');
+const { PHOTON_EVENTS, PHOTON_OPERATIONS, PHOTON_PARAMS, PHOTON_RETURN_CODES } = require('../protocol/constants');
 const EventEmitter = require('events');
+const gp = require('../protocol/gpbinary');
 const logger = require('../utils/logger');
 
 /**
@@ -29,6 +30,7 @@ class PhotonRoom extends EventEmitter {
         this._peers = new Map();
         this._cachedEvents = new Map();
         this._expectedUsers = new Set();
+        this._actorCounter = 0;
         
         logger.info('PhotonRoom created', { 
             roomName: this.name, 
@@ -329,6 +331,7 @@ class PhotonRoom extends EventEmitter {
     _addPeerToRoom(peer) {
         this._peers.set(peer.peerId, peer);
         peer.setRoom(this);
+        peer.actorNr = ++this._actorCounter;
 
         // Set master client if first player
         if (this._peers.size === 1) {
@@ -345,14 +348,9 @@ class PhotonRoom extends EventEmitter {
      * @param {PhotonPeer} peer - Joining peer
      */
     _handlePeerJoinEvents(peer) {
-        // Send join response to joining peer
-        this._sendJoinResponse(peer);
-
-        // Send cached events to new peer
-        this._sendCachedEventsToNewPeer(peer);
-
-        // Notify other peers about the join
-        this._broadcastPeerJoin(peer);
+        // The operation handler orchestrates the join response, Join event
+        // and cached-event replay so they use correct wire parameters and
+        // arrive in the right order.
     }
 
     /**
@@ -428,8 +426,9 @@ class PhotonRoom extends EventEmitter {
 
         try {
             const sessionDuration = this._calculateSessionDuration(peer);
+            const actorNr = peer.actorNr;
             this._removePeerFromRoom(peer);
-            this._handlePeerLeaveEvents(peer);
+            this._handlePeerLeaveEvents(peer, actorNr);
             this._updateLeaveStats(sessionDuration);
 
             logger.info('Peer left room', {
@@ -486,13 +485,14 @@ class PhotonRoom extends EventEmitter {
      * @private
      * @param {PhotonPeer} peer - Leaving peer
      */
-    _handlePeerLeaveEvents(peer) {
-        // Notify remaining peers about the leave
+    _handlePeerLeaveEvents(peer, actorNr) {
+        // Notify remaining peers about the leave (LoadBalancing Leave event)
         this._broadcastEvent(PHOTON_EVENTS.LEAVE, {
-            actorNr: peer.peerId,
-            masterClientId: this._state.masterClientId,
-            isInactive: false
+            [PHOTON_PARAMS.ACTOR_NR]: gp.T.int(actorNr || 0)
         });
+
+        // Drop the leaver's cached events unless they were cached globally
+        this.removeCachedEvents(actorNr, null, false);
     }
 
     /**
@@ -573,11 +573,14 @@ class PhotonRoom extends EventEmitter {
 
             this._state.stats.masterClientChanges++;
 
-            // Notify all peers
-            this._broadcastEvent(PHOTON_EVENTS.MASTER_CLIENT_SWITCHED, {
-                newMasterClientId: peerId,
-                actorNr: peerId
-            });
+            // Notify peers (skip on first join — clients derive the initial
+            // master from the actor list themselves)
+            if (this._peers.size > 1) {
+                const master = this._peers.get(peerId);
+                this._broadcastEvent(PHOTON_EVENTS.MASTER_CLIENT_SWITCHED, {
+                    [PHOTON_PARAMS.MASTER_CLIENT_ID]: gp.T.int(master ? master.actorNr : 0)
+                });
+            }
 
             logger.info('Master client changed', {
                 roomName: this.name,
@@ -608,10 +611,10 @@ class PhotonRoom extends EventEmitter {
             return null;
         }
 
-        // Select the peer with the lowest ID (most stable approach)
-        const peerIds = Array.from(this._peers.keys()).sort((a, b) => a - b);
-        const newMasterId = peerIds[0];
-        
+        // Select the peer with the lowest actor number (Photon convention)
+        const peers = Array.from(this._peers.values()).sort((a, b) => a.actorNr - b.actorNr);
+        const newMasterId = peers[0].peerId;
+
         this._setMasterClient(newMasterId);
         return newMasterId;
     }
@@ -627,6 +630,62 @@ class PhotonRoom extends EventEmitter {
      */
     broadcastEvent(eventCode, parameters = {}, excludePeerId = null) {
         return this._broadcastEvent(eventCode, parameters, excludePeerId);
+    }
+
+    /**
+     * Cache an event so late joiners receive it (RaiseEvent cache options).
+     * @param {number} actorNr - Actor that raised the event
+     * @param {number} eventCode - Event code
+     * @param {Object} parameters - Byte-code keyed, typed event parameters
+     * @param {boolean} [global=false] - Keep after the actor leaves
+     */
+    cacheRoomEvent(actorNr, eventCode, parameters, global = false) {
+        if (this._cachedEvents.size >= this._config.maxCachedEvents) {
+            const firstKey = this._cachedEvents.keys().next().value;
+            this._cachedEvents.delete(firstKey);
+        }
+
+        this._cachedEvents.set(`${actorNr}_${eventCode}_${Date.now()}_${this._cachedEvents.size}`, {
+            actorNr,
+            eventCode,
+            parameters,
+            global,
+            timestamp: Date.now()
+        });
+    }
+
+    /**
+     * Remove cached events by actor and/or event code.
+     * @param {number} actorNr - Actor filter
+     * @param {number|null} [eventCode=null] - Optional event code filter
+     * @param {boolean} [includeGlobal=true] - Also remove globally cached events
+     */
+    removeCachedEvents(actorNr, eventCode = null, includeGlobal = true) {
+        for (const [key, cached] of this._cachedEvents) {
+            if (cached.actorNr !== actorNr) continue;
+            if (eventCode !== null && cached.eventCode !== eventCode) continue;
+            if (!includeGlobal && cached.global) continue;
+            this._cachedEvents.delete(key);
+        }
+    }
+
+    /**
+     * Send all cached events to a newly joined peer.
+     * @param {PhotonPeer} peer - The new peer
+     */
+    replayCachedEvents(peer) {
+        for (const cached of this._cachedEvents.values()) {
+            try {
+                peer.sendEvent(cached.eventCode, cached.parameters);
+            } catch (error) {
+                logger.error('Failed to replay cached event', {
+                    roomName: this.name,
+                    peerId: peer.peerId,
+                    eventCode: cached.eventCode,
+                    error: error.message
+                });
+            }
+        }
     }
 
     /**
