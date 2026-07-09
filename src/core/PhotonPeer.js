@@ -401,10 +401,13 @@ class PhotonPeer extends EventEmitter {
                 }
             } catch (error) {
                 this.updateStats('errors', 1);
-                logger.error('Failed to decrypt message — capturing for analysis', {
+                logger.error('Failed to decrypt message — capturing full DH material for analysis', {
                     peerId: this._peerId,
                     messageType: message.messageType,
                     error: error.message,
+                    clientPublicKey: this._encryption.clientPublicKeyHex,
+                    serverPublicKey: this._encryption.serverPublicKeyRawHex,
+                    serverPrivateKey: this._encryption.privateKeyHex,
                     sharedSecret: this._encryption.sharedSecretHex,
                     ciphertext: message.raw.toString('hex')
                 });
